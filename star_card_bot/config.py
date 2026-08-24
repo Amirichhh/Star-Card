@@ -4,7 +4,7 @@ import os
 #   ОСНОВНЫЕ НАСТРОЙКИ
 # =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8953910275:AAFkSWvGCxwnTCmbmIdpHk5xNdDw2wrS4YY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8977236753:AAE_lEIxkj00CDwO_P536kvSA9vEYWlcOZ0")
 
 # ID главного администратора (главных админов может быть несколько)
 ADMIN_IDS = [1727103213]  # <-- замени на свой Telegram ID
