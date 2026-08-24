@@ -3,35 +3,50 @@ from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
-from database import cards as cards_db, users as users_db, inventory as inv_db
+from database import cards as cards_db, users as users_db, inventory as inv_db, crafts as crafts_db, holdings as holdings_db
 from config import ADMIN_IDS, MARKET_COMMISSION, RARITY_NAMES, RARITY_MULTIPLIERS
 from services import pricing
+from services.valuation import resolve_card_info
 from states import AutoSell, UpgradeCards, TransferCard
 from keyboards.user_kb import confirm_kb
 
 router = Router(name="trading")
 
 
-async def _resolve_base_card(card_type: str, ref_id: int):
-    """Для 'base' возвращает саму карту. Для 'upgrade' — базовую карту, к которой
-    привязан вариант улучшения, плюс редкость варианта."""
+async def _resolve_unit(card_type: str, ref_id: int):
+    """Возвращает (base_card_or_None, multiplier_or_None, label, unit_value).
+    Для base/upgrade курс привязан к конкретной базовой карте (её курс двигается
+    при продаже). Для craft курс фиксирован (ингредиенты могут быть разнородными),
+    поэтому base_card = None и цена не "проседает" от продажи."""
+    if card_type == "craft":
+        recipe = await crafts_db.get_recipe(ref_id)
+        if not recipe:
+            return None, None, None, None
+        value = await crafts_db.recipe_value(ref_id)
+        label = f"🧪 «{recipe['name']}»"
+        return None, None, label, value
+
     if card_type == "base":
         card = await cards_db.get_card(ref_id)
-        return card, None
-    variant = await cards_db.get_variant(ref_id)
-    if not variant:
-        return None, None
-    release = await cards_db.get_release(variant["release_id"])
-    if not release:
-        return None, None
-    card = await cards_db.get_card(release["base_card_id"])
-    return card, variant["rarity"]
+        if not card:
+            return None, None, None, None
+        return card, 1.0, card["name"], card["current_rate"]
 
+    if card_type == "upgrade":
+        variant = await cards_db.get_variant(ref_id)
+        if not variant:
+            return None, None, None, None
+        release = await cards_db.get_release(variant["release_id"])
+        if not release:
+            return None, None, None, None
+        card = await cards_db.get_card(release["base_card_id"])
+        if not card:
+            return None, None, None, None
+        mult = RARITY_MULTIPLIERS.get(variant["rarity"], 1.0)
+        label = f"{RARITY_NAMES.get(variant['rarity'], variant['rarity'])} «{variant['name']}»"
+        return card, mult, label, card["current_rate"] * mult
 
-def _unit_price(base_card, rarity: str | None) -> float:
-    if rarity is None:
-        return base_card["current_rate"]
-    return cards_db.variant_value(base_card["current_rate"], rarity)
+    return None, None, None, None
 
 
 # ============================================================
@@ -47,18 +62,21 @@ async def cb_autosell_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("У вас нет таких карт", show_alert=True)
         return
 
-    base_card, rarity = await _resolve_base_card(card_type, ref_id)
-    if not base_card:
+    held, held_until = await holdings_db.is_locked(callback.from_user.id, card_type, ref_id)
+    if held:
+        await callback.answer(f"🔒 Вы захолдили эти карты до {held_until} UTC — снимите холд, чтобы продать", show_alert=True)
+        return
+
+    base_card, mult, label, unit_value = await _resolve_unit(card_type, ref_id)
+    if label is None:
         await callback.answer("❌ Карта не найдена", show_alert=True)
         return
 
     await callback.answer()
-    unit_price = _unit_price(base_card, rarity)
-    label = base_card["name"] if rarity is None else f"{RARITY_NAMES.get(rarity, rarity)} «{base_card['name']}»"
     await state.set_state(AutoSell.quantity)
     await state.update_data(card_type=card_type, ref_id=ref_id)
     await callback.message.answer(
-        f"📉 Продажа карты «<b>{label}</b>» боту по текущему курсу (⭐ {unit_price:.2f}/шт).\n"
+        f"📉 Продажа карты «<b>{label}</b>» боту по текущему курсу (⭐ {unit_value:.2f}/шт).\n"
         f"У вас есть: <b>{owned} шт.</b>\n\n"
         f"Сколько продать? Введите число (или «все»):",
         parse_mode="HTML",
@@ -84,24 +102,31 @@ async def process_autosell_qty(message: Message, state: FSMContext):
         await message.answer(f"❗ Введите число от 1 до {owned}.")
         return
 
-    base_card, rarity = await _resolve_base_card(card_type, ref_id)
-    if not base_card:
+    base_card, mult, label, unit_value = await _resolve_unit(card_type, ref_id)
+    if label is None:
         await message.answer("❌ Карта не найдена.")
         await state.clear()
         return
 
-    rate = base_card["current_rate"]
-    mult = RARITY_MULTIPLIERS.get(rarity, 1.0) if rarity else 1.0
-    gross = 0.0
-    for _ in range(qty):
-        gross += rate * mult
-        rate = pricing.apply_trade(rate, rate, "sell", base_card["base_price"])
+    if base_card is None:
+        # crafted-карта: фиксированная цена, без проседания курса
+        gross = unit_value * qty
+        final_base_rate = None
+        base_card_id = None
+    else:
+        rate = base_card["current_rate"]
+        gross = 0.0
+        for _ in range(qty):
+            gross += rate * mult
+            rate = pricing.apply_trade(rate, rate, "sell", base_card["base_price"])
+        final_base_rate = rate
+        base_card_id = base_card["card_id"]
+
     commission = round(gross * MARKET_COMMISSION, 2)
     net = round(gross - commission, 2)
 
-    label = base_card["name"] if rarity is None else f"{RARITY_NAMES.get(rarity, rarity)} «{base_card['name']}»"
     await state.update_data(qty=qty, gross=gross, commission=commission, net=net,
-                             final_base_rate=rate, base_card_id=base_card["card_id"])
+                             final_base_rate=final_base_rate, base_card_id=base_card_id)
     await state.set_state(AutoSell.confirm)
     await message.answer(
         f"📉 Продажа {qty} шт. «{label}»:\n\n"
@@ -129,11 +154,15 @@ async def cb_autosell_confirm(callback: CallbackQuery, state: FSMContext):
                                    f"Продажа {qty} карт ({card_type} {ref_id})")
     await users_db.change_balance(ADMIN_IDS[0], data["commission"], "market_commission",
                                    f"Комиссия с продажи {qty} карт ({card_type} {ref_id})")
-    await cards_db.update_card_rate(data["base_card_id"], data["final_base_rate"])
+    if data.get("base_card_id") is not None:
+        await cards_db.update_card_rate(data["base_card_id"], data["final_base_rate"])
 
     await callback.answer("✅ Продано!")
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"✅ Получено ⭐ {data['net']:.2f} на баланс.")
+    await callback.message.answer(
+        f"✅ <b>Продажа завершена</b>\n━━━━━━━━━━━━━━━━\n💰 Получено: <b>⭐ {data['net']:.2f}</b> на баланс.",
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
@@ -143,6 +172,7 @@ async def cb_autosell_confirm(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("upgrade_start:"))
 async def cb_upgrade_start(callback: CallbackQuery, state: FSMContext):
     card_id = int(callback.data.split(":")[1])
+    card = await cards_db.get_card(card_id)
     release = await cards_db.get_active_release_for_card(card_id)
     if not release:
         await callback.answer("Сейчас нет активных улучшений для этой карты", show_alert=True)
@@ -266,6 +296,10 @@ async def cb_gift_start(callback: CallbackQuery, state: FSMContext):
     if owned == 0:
         await callback.answer("У вас нет таких карт", show_alert=True)
         return
+    held, held_until = await holdings_db.is_locked(callback.from_user.id, "upgrade", variant_id)
+    if held:
+        await callback.answer(f"🔒 Вы захолдили эти карты до {held_until} UTC — снимите холд, чтобы передать", show_alert=True)
+        return
 
     await callback.answer()
     await state.set_state(TransferCard.quantity)
@@ -354,3 +388,4 @@ async def cb_gift_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
         )
     except Exception:
         pass
+

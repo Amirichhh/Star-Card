@@ -5,10 +5,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def admin_panel_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="🃏 Создать карту"), KeyboardButton(text="⚗️ Выпустить улучшения")],
-        [KeyboardButton(text="⏯ Управление улучшениями"), KeyboardButton(text="💰 Изменить баланс")],
-        [KeyboardButton(text="🎫 Создать чек"), KeyboardButton(text="🛡 Модераторы")],
-        [KeyboardButton(text="📢 Каналы"), KeyboardButton(text="🚫 Бан/Разбан")],
-        [KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="⏯ Управление улучшениями"), KeyboardButton(text="🧪 Создать крафт")],
+        [KeyboardButton(text="⏯ Управление крафтом"), KeyboardButton(text="🎛 Кнопка крафта в меню")],
+        [KeyboardButton(text="🗳 Заявки на карты"), KeyboardButton(text="💰 Изменить баланс")],
+        [KeyboardButton(text="💱 Канал для выводов"), KeyboardButton(text="🎫 Создать чек")],
+        [KeyboardButton(text="🛡 Модераторы"), KeyboardButton(text="📢 Каналы")],
+        [KeyboardButton(text="🚫 Бан/Разбан"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -29,6 +31,22 @@ def rarity_pick_kb() -> InlineKeyboardMarkup:
     b.button(text="🟠 Мифическая", callback_data="rarity:mythic")
     b.button(text="🟡 Легендарная", callback_data="rarity:legendary")
     b.adjust(2, 2)
+    return b.as_markup()
+
+
+def stock_choice_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="♾ Без ограничений", callback_data="stock:unlimited")
+    b.button(text="🔢 Указать количество", callback_data="stock:limited")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def card_review_kb(card_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Одобрить", callback_data=f"card_approve:{card_id}")
+    b.button(text="❌ Отклонить", callback_data=f"card_reject:{card_id}")
+    b.adjust(2)
     return b.as_markup()
 
 
@@ -58,6 +76,16 @@ def releases_manage_kb(releases_with_cards) -> InlineKeyboardMarkup:
             text=f"{rel['card_name']} — релиз #{rel['release_id']} ({icon})",
             callback_data=f"toggle_release:{rel['release_id']}",
         ))
+    return b.as_markup()
+
+
+def craft_menu_toggle_kb(visible: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if visible:
+        b.button(text="🙈 Скрыть кнопку «Крафт» из меню", callback_data="craftmenu_hide")
+    else:
+        b.button(text="👁 Показать кнопку «Крафт» в меню", callback_data="craftmenu_show")
+    b.adjust(1)
     return b.as_markup()
 
 

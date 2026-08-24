@@ -4,6 +4,8 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from database import withdraw as wd_db, tickets as tickets_db, users as users_db
+from database.db import get_setting
+from config import WITHDRAW_LOG_CHANNEL_SETTING_KEY
 from states import StaffReply
 from keyboards.admin_kb import moderator_panel_kb, withdraw_review_kb, ticket_review_kb
 from filters import IsStaff
@@ -69,6 +71,17 @@ async def cb_wd_approve(callback: CallbackQuery, bot: Bot):
         await bot.send_message(req["user_id"], f"✅ Ваша заявка на вывод #{req_id} (⭐ {req['amount']:.2f}) одобрена!")
     except Exception:
         pass
+
+    log_channel = await get_setting(WITHDRAW_LOG_CHANNEL_SETTING_KEY)
+    if log_channel:
+        label = f"@{req['username']}" if req["username"] else f"id {req['user_id']}"
+        try:
+            await bot.send_message(
+                log_channel,
+                f"💸 Пользователю {label} выдано ⭐ {req['amount']:.2f} по заявке на вывод #{req_id}.",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("wd_decline:"))

@@ -1,8 +1,10 @@
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
 
-from database import users as users_db, inventory as inv_db, cards as cards_db
+from database import users as users_db, inventory as inv_db, cards as cards_db, crafts as crafts_db, holdings as holdings_db
 from config import RARITY_NAMES, RARITY_MULTIPLIERS
+from states import LockCard
 from keyboards.user_kb import profile_kb, my_cards_kb, group_view_kb
 from services.image import render_card_image
 
@@ -18,7 +20,8 @@ async def _unit_value_and_change(g):
         value = card["current_rate"]
         chg = cards_db.day_change_percent(card)
         return value, chg, card["name"]
-    else:
+
+    if g["card_type"] == "upgrade":
         variant = await cards_db.get_variant(g["card_ref_id"])
         if not variant:
             return 0.0, 0.0, "❓ Неизвестное улучшение"
@@ -30,6 +33,16 @@ async def _unit_value_and_change(g):
         chg = cards_db.day_change_percent(card)
         label = f"{RARITY_NAMES.get(variant['rarity'], variant['rarity'])} «{variant['name']}»"
         return value, chg, label
+
+    if g["card_type"] == "craft":
+        recipe = await crafts_db.get_recipe(g["card_ref_id"])
+        if not recipe:
+            return 0.0, 0.0, "❓ Неизвестный крафт"
+        value = await crafts_db.recipe_value(g["card_ref_id"])
+        label = f"🧪 «{recipe['name']}»"
+        return value, 0.0, label
+
+    return 0.0, 0.0, "❓ Неизвестная карта"
 
 
 async def _portfolio_summary(user_id: int):
@@ -70,7 +83,8 @@ async def render_profile(message: Message, user_id: int):
     change_icon = "🟢" if overall_change >= 0 else "🔴"
 
     text = (
-        f"👤 <b>Ваш профиль</b>\n\n"
+        "👤 <b>Ваш профиль</b>\n"
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n"
         f"💰 Баланс: <b>⭐ {user['balance']:.2f}</b>\n"
         f"🗂 Карт в коллекции: <b>{cards_count}</b>\n\n"
         f"📦 Стоимость портфеля сейчас: <b>⭐ {total_value:.2f}</b>\n"
@@ -101,7 +115,7 @@ async def cb_my_cards(callback: CallbackQuery):
             "card_type": r["card_type"], "ref_id": r["ref_id"],
             "label": f"{r['label']} ×{r['qty']} — ⭐ {r['current_total']:.2f} ({icon}{r['profit_pct']:+.1f}%)",
         })
-    await callback.message.answer("🗂 <b>Ваши карты</b> (сгруппировано):", parse_mode="HTML",
+    await callback.message.answer("🗂 <b>Ваши карты</b>\n━━━━━━━━━━━━━━━━\nСгруппировано по типу:", parse_mode="HTML",
                                    reply_markup=my_cards_kb(groups))
 
 
@@ -110,8 +124,13 @@ async def _group_photo_info(card_type: str, ref_id: int):
     if card_type == "base":
         card = await cards_db.get_card(ref_id)
         return (card["photo_file_id"], None) if card else (None, None)
-    variant = await cards_db.get_variant(ref_id)
-    return (variant["photo_file_id"], variant["rarity"]) if variant else (None, None)
+    if card_type == "upgrade":
+        variant = await cards_db.get_variant(ref_id)
+        return (variant["photo_file_id"], variant["rarity"]) if variant else (None, None)
+    if card_type == "craft":
+        recipe = await crafts_db.get_recipe(ref_id)
+        return (recipe["photo_file_id"], None) if recipe else (None, None)
+    return None, None
 
 
 @router.callback_query(F.data.startswith("group_view:"))
@@ -129,18 +148,25 @@ async def cb_group_view(callback: CallbackQuery, bot: Bot):
         release = await cards_db.get_active_release_for_card(ref_id)
         has_release = release is not None
 
+    held, held_until = await holdings_db.is_locked(callback.from_user.id, card_type, ref_id)
+
     g = {"card_type": card_type, "card_ref_id": ref_id, "qty": qty, "invested": 0}
     unit_value, chg, label = await _unit_value_and_change(g)
     total = unit_value * qty
+    trend = "🟢" if chg >= 0 else "🔴"
 
     text = (
-        f"🃏 <b>{label}</b>\n\n"
+        f"🃏 <b>{label}</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
         f"Количество: <b>{qty} шт.</b>\n"
         f"Курс за 1 шт.: ⭐ {unit_value:.2f}\n"
-        f"Изменение за сегодня: {chg:+.2f}%\n"
+        f"{trend} Изменение за сегодня: {chg:+.2f}%\n"
         f"Стоимость всех: <b>⭐ {total:.2f}</b>"
+        + (f"\n\n🔒 <b>Захолдено до {held_until} UTC</b> — продажа и передача "
+           f"недоступны и не могут быть сняты досрочно ни при каких условиях."
+           if held else "")
     )
-    kb = group_view_kb(card_type, ref_id, has_release)
+    kb = group_view_kb(card_type, ref_id, has_release, held)
 
     photo_file_id, rarity = await _group_photo_info(card_type, ref_id)
     if photo_file_id:
@@ -153,3 +179,61 @@ async def cb_group_view(callback: CallbackQuery, bot: Bot):
         return
 
     await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ============================================================
+#   ХОЛДИНГ КАРТ (личная блокировка продажи, ставит каждый пользователь себе сам)
+#   Важно: снять холд ДОСРОЧНО невозможно ни при каких условиях — только
+#   дождаться истечения выбранного срока. Кнопки ручного снятия в интерфейсе нет.
+# ============================================================
+
+@router.callback_query(F.data.startswith("hold_start:"))
+async def cb_hold_start(callback: CallbackQuery, state: FSMContext):
+    _, card_type, ref_id = callback.data.split(":")
+    ref_id = int(ref_id)
+    owned = await inv_db.count_owned(callback.from_user.id, card_type, ref_id)
+    if owned == 0:
+        await callback.answer("У вас нет таких карт", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(LockCard.days)
+    await state.update_data(card_type=card_type, ref_id=ref_id)
+    await callback.message.answer(
+        "🔒 <b>Холд карт</b>\n━━━━━━━━━━━━━━━━\n"
+        "На сколько дней захолдить эти карты? Пока холд активен, вы не сможете их "
+        "продать или передать — и <b>отменить холд досрочно будет нельзя</b>, только "
+        "дождаться срока. Введите число дней:",
+        parse_mode="HTML",
+    )
+
+
+@router.message(LockCard.days)
+async def process_hold_days(message: Message, state: FSMContext):
+    if not message.text.strip().replace(".", "", 1).isdigit():
+        await message.answer("❗ Введите число дней.")
+        return
+    data = await state.get_data()
+    days = float(message.text.strip())
+    if days <= 0:
+        await message.answer("❗ Введите число дней больше 0.")
+        return
+    await holdings_db.lock(message.from_user.id, data["card_type"], data["ref_id"], days)
+    await state.clear()
+    await message.answer(
+        f"🔒 <b>Захолдено на {days:g} дн.</b>\n"
+        f"Продажа и передача этих карт недоступны до истечения срока — досрочно "
+        f"снять холд не получится.",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("unhold:"))
+async def cb_unhold_blocked(callback: CallbackQuery):
+    """Кнопки ручного снятия холда в интерфейсе больше нет, но старые сообщения
+    в чатах пользователей могли остаться с этой callback_data — на всякий случай
+    отвечаем явным отказом, а не тихо снимаем холд."""
+    await callback.answer(
+        "🔒 Снять холд досрочно нельзя. Дождитесь истечения срока — после этого "
+        "карты снова станут доступны для продажи и передачи.",
+        show_alert=True,
+    )

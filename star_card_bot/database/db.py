@@ -37,12 +37,18 @@ CREATE TABLE IF NOT EXISTS moderators (
 CREATE TABLE IF NOT EXISTS cards (
     card_id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    description TEXT,
     photo_file_id TEXT NOT NULL,
     base_price REAL NOT NULL,
     current_rate REAL NOT NULL,
     day_open_rate REAL NOT NULL,
     day_high_rate REAL NOT NULL,
     day_date TEXT NOT NULL,
+    stock_total INTEGER,              -- NULL = безграничный тираж
+    stock_left INTEGER,               -- NULL = безграничный тираж
+    is_user_created INTEGER DEFAULT 0,
+    approval_status TEXT DEFAULT 'approved',  -- pending | approved | rejected (для карт от юзеров)
+    locked_until TEXT,                -- до какой даты создатель заблокировал куплю/продажу карты
     is_active INTEGER DEFAULT 1,
     created_by INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -72,11 +78,35 @@ CREATE TABLE IF NOT EXISTS upgrade_variants (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+-- "Крафт" - ингредиенты задаются поштучно и могут быть ЛЮБОГО типа
+-- (обычная карта / конкретная улучшенная карта).
+-- Крафт бесплатный (звёзды не берутся), но ингредиенты списываются ВСЕГДА,
+-- независимо от результата - а сам результат выпадает только с шансом
+-- success_chance. Не повезло - все вложенные карты просто сгорают.
+CREATE TABLE IF NOT EXISTS craft_recipes (
+    recipe_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    photo_file_id TEXT NOT NULL,
+    success_chance REAL NOT NULL,     -- 0.0 - 1.0
+    is_draft INTEGER DEFAULT 1,
+    is_paused INTEGER DEFAULT 0,
+    created_by INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS craft_ingredients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id INTEGER NOT NULL REFERENCES craft_recipes(recipe_id),
+    card_type TEXT NOT NULL,          -- 'base' | 'upgrade'
+    card_ref_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS user_cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
-    card_type TEXT NOT NULL,          -- 'base' | 'upgrade'
-    card_ref_id INTEGER NOT NULL,     -- cards.card_id или upgrade_variants.variant_id
+    card_type TEXT NOT NULL,          -- 'base' | 'upgrade' | 'craft'
+    card_ref_id INTEGER NOT NULL,     -- cards.card_id / upgrade_variants.variant_id / craft_recipes.recipe_id
     bought_price REAL NOT NULL,
     acquired_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -150,10 +180,62 @@ CREATE TABLE IF NOT EXISTS check_activations (
     activated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(check_id, user_id)
 );
+
+-- Личный "холдинг" карты: пользователь сам блокирует СВОИ конкретные карты
+-- (любого типа) на выбранный срок и не может их продать/подарить, пока не
+-- снимет блокировку или не истечёт срок. Никак не влияет на других пользователей.
+CREATE TABLE IF NOT EXISTS holdings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    card_type TEXT NOT NULL,
+    card_ref_id INTEGER NOT NULL,
+    locked_until TEXT NOT NULL,
+    UNIQUE(user_id, card_type, card_ref_id)
+);
+
+-- Простое хранилище настроек ключ-значение (например id канала для логов выводов).
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
 async def init_db():
     db = await get_db()
     await db.executescript(SCHEMA)
+    await db.commit()
+    await _migrate(db)
+
+
+async def _migrate(db):
+    """Лёгкие миграции для баз, созданных до появления новых колонок.
+    Старые карты при этом остаются безграничными (stock_total/stock_left = NULL)
+    и одобренными (approval_status = 'approved')."""
+    cur = await db.execute("PRAGMA table_info(cards)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    migrations = {
+        "stock_total": "ALTER TABLE cards ADD COLUMN stock_total INTEGER",
+        "stock_left": "ALTER TABLE cards ADD COLUMN stock_left INTEGER",
+        "description": "ALTER TABLE cards ADD COLUMN description TEXT",
+        "is_user_created": "ALTER TABLE cards ADD COLUMN is_user_created INTEGER DEFAULT 0",
+        "approval_status": "ALTER TABLE cards ADD COLUMN approval_status TEXT DEFAULT 'approved'",
+        "locked_until": "ALTER TABLE cards ADD COLUMN locked_until TEXT",
+    }
+    for col, ddl in migrations.items():
+        if col not in columns:
+            await db.execute(ddl)
+    await db.commit()
+
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    db = await get_db()
+    cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = await cur.fetchone()
+    return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str):
+    db = await get_db()
+    await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     await db.commit()

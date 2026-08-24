@@ -4,8 +4,36 @@ from aiogram.fsm.state import State, StatesGroup
 class CreateCard(StatesGroup):
     photo = State()
     name = State()
+    description = State()
     price = State()
+    stock_choice = State()
+    stock_count = State()
     confirm = State()
+
+
+class CreateUserCard(StatesGroup):
+    """Обычный пользователь создаёт свою карту - уходит на модерацию."""
+    photo = State()
+    name = State()
+    description = State()
+    stock_choice = State()
+    stock_count = State()
+    confirm = State()
+
+
+class TransferStars(StatesGroup):
+    target = State()
+    amount = State()
+    confirm = State()
+
+
+class LockCard(StatesGroup):
+    """Личный холдинг: пользователь сам блокирует продажу СВОИХ карт на N дней."""
+    days = State()
+
+
+class SetWithdrawChannel(StatesGroup):
+    channel_id = State()
 
 
 class CreateRelease(StatesGroup):
@@ -45,6 +73,21 @@ class TransferCard(StatesGroup):
     """Передача улучшенных карт другому пользователю."""
     quantity = State()
     target = State()
+    confirm = State()
+
+
+class CreateCraft(StatesGroup):
+    """Админ создаёт рецепт крафта: конкретные карты-ингредиенты (любого типа,
+    включая улучшенные) -> 1 карта-результат. Бесплатно, но с шансом провала,
+    при котором все ингредиенты сгорают.
+    Цикл: ingredient_type -> ingredient_pick -> ingredient_qty -> (снова
+    ingredient_type ИЛИ confirm), пока админ не нажмёт «Готово, опубликовать»."""
+    name = State()
+    photo = State()
+    success_chance = State()
+    ingredient_type = State()
+    ingredient_pick = State()
+    ingredient_qty = State()
     confirm = State()
 
 

@@ -26,14 +26,15 @@ async def _render_list(message: Message, page: int, search: str | None, prefix: 
     header = title
     if search:
         header += f"\n🔍 Поиск: «{search}»"
-    await message.answer(header, reply_markup=cards_list_kb(cards, page, has_next, prefix, with_search=(prefix == "shop")))
+    await message.answer(header, parse_mode="HTML",
+                          reply_markup=cards_list_kb(cards, page, has_next, prefix, with_search=(prefix == "shop")))
 
 
 @router.message(F.text == "🛍 Магазин карт")
 @router.message(F.text == "/shop")
 async def shop_menu(message: Message, state: FSMContext):
     await state.update_data(shop_search=None)
-    await _render_list(message, 0, None, "shop", "🛍 <b>Магазин карт</b>\nВыберите карту:")
+    await _render_list(message, 0, None, "shop", "🛍 <b>Магазин карт</b>\n━━━━━━━━━━━━━━━━\nВыберите карту:")
 
 
 @router.callback_query(F.data.startswith("shop_page:"))
@@ -70,7 +71,7 @@ async def market_menu(message: Message):
         await message.answer("😔 Пока нет карт в обороте.")
         return
     await message.answer(
-        "📈 <b>Биржа Star Card</b>\nТоп карт по изменению курса за сегодня:",
+        "📈 <b>Биржа Star Card</b>\n━━━━━━━━━━━━━━━━\n🏆 Топ карт по изменению курса за сегодня:",
         parse_mode="HTML",
         reply_markup=cards_list_kb(ranked, 0, False, "shop"),
     )
@@ -87,16 +88,24 @@ async def cb_card_view(callback: CallbackQuery, bot: Bot):
 
     release = await cards_db.get_active_release_for_card(card_id)
     chg = cards_db.day_change_percent(card)
+    in_stock = card["stock_left"] is None or card["stock_left"] > 0
+    trend = "🟢" if chg >= 0 else "🔴"
 
-    caption = (
-        f"🃏 <b>{card['name']}</b>\n\n"
-        f"💫 Текущий курс: <b>⭐ {card['current_rate']:.2f}</b>\n"
-        f"📊 Изменение за сегодня: {chg:+.2f}%\n"
-        f"🚀 Максимум за сегодня: ⭐ {card['day_high_rate']:.2f}\n"
-        f"{'⚗️ Доступно улучшение!' if release else ''}"
-    )
+    lines = [f"🃏 <b>{card['name']}</b>", "━━━━━━━━━━━━━━━━"]
+    if card["description"]:
+        lines.append(f"<i>{card['description']}</i>")
+        lines.append("")
+    lines += [
+        f"💫 Текущий курс: <b>⭐ {card['current_rate']:.2f}</b>",
+        f"{trend} Изменение за сегодня: <b>{chg:+.2f}%</b>",
+        f"🚀 Максимум за сегодня: ⭐ {card['day_high_rate']:.2f}",
+        f"📦 Осталось: {cards_db.stock_label(card)}",
+    ]
+    if release:
+        lines.append("\n⚗️ <b>Доступно улучшение этой карты!</b>")
+    caption = "\n".join(lines)
     photo = await render_card_image(bot, card["photo_file_id"], card["name"], card["current_rate"], None, chg)
-    kb = card_view_kb(card_id, card["current_rate"], release is not None)
+    kb = card_view_kb(card_id, card["current_rate"], release is not None, in_stock=in_stock)
     if photo:
         await callback.message.answer_photo(photo, caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
@@ -110,6 +119,9 @@ async def cb_buy_base(callback: CallbackQuery):
     if not card or not card["is_active"]:
         await callback.answer("❌ Карта недоступна", show_alert=True)
         return
+    if card["stock_left"] is not None and card["stock_left"] <= 0:
+        await callback.answer("❌ Тираж этой карты полностью раскуплен", show_alert=True)
+        return
 
     user = await users_db.get_user(callback.from_user.id)
     price = card["current_rate"]
@@ -121,13 +133,16 @@ async def cb_buy_base(callback: CallbackQuery):
     # 100% выручки от продажи карт магазином идёт админу-эмитенту
     await users_db.change_balance(ADMIN_IDS[0], price, "shop_revenue", f"Продажа карты «{card['name']}»")
     await inv_db.add_to_inventory(callback.from_user.id, "base", card_id, price)
+    await cards_db.decrement_stock(card_id)
 
     new_rate = pricing.apply_trade(card["current_rate"], price, "buy", card["base_price"])
     await cards_db.update_card_rate(card_id, new_rate)
 
     await callback.answer("✅ Куплено!", show_alert=False)
     await callback.message.answer(
-        f"🎉 Вы купили карту «<b>{card['name']}</b>» за ⭐ {price:.2f}!\n"
-        f"Новый курс: ⭐ {new_rate:.2f}",
+        f"🎉 <b>Покупка успешна!</b>\n━━━━━━━━━━━━━━━━\n"
+        f"🃏 Карта: «<b>{card['name']}</b>»\n"
+        f"💳 Оплачено: ⭐ {price:.2f}\n"
+        f"📈 Новый курс: ⭐ {new_rate:.2f}",
         parse_mode="HTML",
     )

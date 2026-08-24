@@ -15,12 +15,18 @@ def _today() -> str:
 
 # ---------------- BASE CARDS ----------------
 
-async def create_card(name: str, photo_file_id: str, base_price: float, created_by: int) -> int:
+async def create_card(name: str, photo_file_id: str, base_price: float, created_by: int,
+                       description: str | None = None, stock_total: int | None = None,
+                       is_user_created: bool = False, approval_status: str = "approved") -> int:
     db = await get_db()
+    is_active = 1 if approval_status == "approved" else 0
     cur = await db.execute(
-        "INSERT INTO cards (name, photo_file_id, base_price, current_rate, day_open_rate, day_high_rate, day_date, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, photo_file_id, base_price, base_price, base_price, base_price, _today(), created_by),
+        "INSERT INTO cards (name, description, photo_file_id, base_price, current_rate, "
+        "day_open_rate, day_high_rate, day_date, stock_total, stock_left, "
+        "is_user_created, approval_status, is_active, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, description, photo_file_id, base_price, base_price, base_price, base_price, _today(),
+         stock_total, stock_total, 1 if is_user_created else 0, approval_status, is_active, created_by),
     )
     await db.commit()
     return cur.lastrowid
@@ -36,15 +42,19 @@ async def get_card(card_id: int):
 
 
 async def list_active_cards(search: str | None = None, limit: int = 6, offset: int = 0):
+    """Карты, доступные в магазине: активные и одобренные (обычные админские карты
+    одобрены по умолчанию)."""
     db = await get_db()
     if search:
         cur = await db.execute(
-            "SELECT * FROM cards WHERE is_active = 1 AND name LIKE ? ORDER BY card_id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM cards WHERE is_active = 1 AND approval_status = 'approved' AND name LIKE ? "
+            "ORDER BY card_id DESC LIMIT ? OFFSET ?",
             (f"%{search}%", limit, offset),
         )
     else:
         cur = await db.execute(
-            "SELECT * FROM cards WHERE is_active = 1 ORDER BY card_id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM cards WHERE is_active = 1 AND approval_status = 'approved' "
+            "ORDER BY card_id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
     return await cur.fetchall()
@@ -53,9 +63,14 @@ async def list_active_cards(search: str | None = None, limit: int = 6, offset: i
 async def count_active_cards(search: str | None = None) -> int:
     db = await get_db()
     if search:
-        cur = await db.execute("SELECT COUNT(*) as c FROM cards WHERE is_active = 1 AND name LIKE ?", (f"%{search}%",))
+        cur = await db.execute(
+            "SELECT COUNT(*) as c FROM cards WHERE is_active = 1 AND approval_status = 'approved' AND name LIKE ?",
+            (f"%{search}%",),
+        )
     else:
-        cur = await db.execute("SELECT COUNT(*) as c FROM cards WHERE is_active = 1")
+        cur = await db.execute(
+            "SELECT COUNT(*) as c FROM cards WHERE is_active = 1 AND approval_status = 'approved'"
+        )
     row = await cur.fetchone()
     return row["c"]
 
@@ -64,6 +79,66 @@ async def set_card_active(card_id: int, active: bool):
     db = await get_db()
     await db.execute("UPDATE cards SET is_active = ? WHERE card_id = ?", (1 if active else 0, card_id))
     await db.commit()
+
+
+def stock_label(card) -> str:
+    """Человекочитаемая строка остатка тиража: число либо знак бесконечности."""
+    if card["stock_left"] is None:
+        return "♾ безгранично"
+    return f"{max(card['stock_left'], 0)} шт."
+
+
+async def decrement_stock(card_id: int):
+    db = await get_db()
+    await db.execute(
+        "UPDATE cards SET stock_left = stock_left - 1 WHERE card_id = ? AND stock_left IS NOT NULL",
+        (card_id,),
+    )
+    await db.commit()
+
+
+# ---------------- КАРТЫ ОТ ПОЛЬЗОВАТЕЛЕЙ (модерация) ----------------
+
+async def list_pending_cards():
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM cards WHERE is_user_created = 1 AND approval_status = 'pending' ORDER BY created_at ASC"
+    )
+    return await cur.fetchall()
+
+
+async def count_pending_cards() -> int:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT COUNT(*) as c FROM cards WHERE is_user_created = 1 AND approval_status = 'pending'"
+    )
+    row = await cur.fetchone()
+    return row["c"]
+
+
+async def approve_card(card_id: int):
+    db = await get_db()
+    await db.execute(
+        "UPDATE cards SET approval_status = 'approved', is_active = 1 WHERE card_id = ?", (card_id,)
+    )
+    await db.commit()
+
+
+async def reject_card(card_id: int):
+    db = await get_db()
+    await db.execute(
+        "UPDATE cards SET approval_status = 'rejected', is_active = 0 WHERE card_id = ?", (card_id,)
+    )
+    await db.commit()
+
+
+async def list_cards_created_by(user_id: int):
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM cards WHERE created_by = ? AND is_user_created = 1 ORDER BY created_at DESC",
+        (user_id,),
+    )
+    return await cur.fetchall()
 
 
 async def _ensure_daily_reset(row):
@@ -152,6 +227,19 @@ async def get_variant(variant_id: int):
     db = await get_db()
     cur = await db.execute("SELECT * FROM upgrade_variants WHERE variant_id = ?", (variant_id,))
     return await cur.fetchone()
+
+
+async def list_all_published_variants():
+    """Все улучшенные карты из опубликованных (не черновых) релизов - используется
+    там, где нужно выбрать конкретную улучшенную карту (например ингредиент крафта)."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT v.*, c.name as base_name FROM upgrade_variants v "
+        "JOIN upgrade_releases r ON v.release_id = r.release_id "
+        "JOIN cards c ON r.base_card_id = c.card_id "
+        "WHERE r.is_draft = 0 ORDER BY v.variant_id DESC"
+    )
+    return await cur.fetchall()
 
 
 async def get_active_release_for_card(base_card_id: int):
